@@ -2853,6 +2853,7 @@ typedef struct {
 
 typedef struct {
     uint32_t flags_changed_store;
+    uint16_t modifier_keys_down;    // reload: the modifier keys reported down, a bit per key code 0x36 to 0x3E
     uint8_t mouse_buttons;
     NSWindow* window;
     NSTrackingArea* tracking_area;
@@ -6661,6 +6662,49 @@ static void _sapp_gl_make_current(void) {
     const uint32_t old_f = _sapp.macos.flags_changed_store;
     const uint32_t new_f = (uint32_t)event.modifierFlags;
     _sapp.macos.flags_changed_store = new_f;
+    /* reload: the key comes from the event's key code, so each side's modifier reports as itself and Caps Lock
+       reports at all (upstream reports every modifier as the left-hand key and drops Caps Lock). The pressed state
+       is the key's family flag, except that a key already reported down reports its release while the flag stays
+       set (two keys of one family held, one let go). Caps Lock, which macOS never releases, reports a press and a
+       release. A key code the table does not know falls back to upstream's reporting below. */
+    const uint16_t vk = event.keyCode;
+    const sapp_keycode vk_code = (vk < SAPP_MAX_KEYCODES) ? _sapp.keycodes[vk] : SAPP_KEYCODE_INVALID;
+    uint32_t family = 0;
+    switch (vk_code) {
+        case SAPP_KEYCODE_LEFT_SHIFT:
+        case SAPP_KEYCODE_RIGHT_SHIFT:   family = NSEventModifierFlagShift; break;
+        case SAPP_KEYCODE_LEFT_CONTROL:
+        case SAPP_KEYCODE_RIGHT_CONTROL: family = NSEventModifierFlagControl; break;
+        case SAPP_KEYCODE_LEFT_ALT:
+        case SAPP_KEYCODE_RIGHT_ALT:     family = NSEventModifierFlagOption; break;
+        case SAPP_KEYCODE_LEFT_SUPER:
+        case SAPP_KEYCODE_RIGHT_SUPER:   family = NSEventModifierFlagCommand; break;
+        case SAPP_KEYCODE_CAPS_LOCK:
+            if ((new_f ^ old_f) & NSEventModifierFlagCapsLock) {
+                _sapp_macos_key_event(SAPP_EVENTTYPE_KEY_DOWN, vk_code, false, _sapp_macos_mods(event));
+                _sapp_macos_key_event(SAPP_EVENTTYPE_KEY_UP, vk_code, false, _sapp_macos_mods(event));
+            }
+            return;
+        default: break;
+    }
+    if (family != 0) {
+        const uint16_t bit = (uint16_t)(1u << ((vk - 0x36) & 15));
+        bool vk_down = 0 != (new_f & family);
+        if (vk_down && (_sapp.macos.modifier_keys_down & bit)) {
+            vk_down = false;
+        }
+        if (vk_down) {
+            _sapp.macos.modifier_keys_down |= bit;
+        }
+        else {
+            _sapp.macos.modifier_keys_down &= (uint16_t)~bit;
+        }
+        _sapp_macos_key_event(vk_down ? SAPP_EVENTTYPE_KEY_DOWN : SAPP_EVENTTYPE_KEY_UP,
+            vk_code,
+            false,
+            _sapp_macos_mods(event));
+        return;
+    }
     sapp_keycode key_code = SAPP_KEYCODE_INVALID;
     bool down = false;
     if ((new_f ^ old_f) & NSEventModifierFlagShift) {
@@ -10111,11 +10155,28 @@ _SOKOL_PRIVATE LRESULT CALLBACK _sapp_win32_wndproc(HWND hWnd, UINT uMsg, WPARAM
                 break;
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
-                _sapp_win32_key_event(SAPP_EVENTTYPE_KEY_DOWN, (int)(HIWORD(lParam)&0x1FF), !!(lParam&0x40000000));
-                break;
             case WM_KEYUP:
             case WM_SYSKEYUP:
-                _sapp_win32_key_event(SAPP_EVENTTYPE_KEY_UP, (int)(HIWORD(lParam)&0x1FF), false);
+                /* reload: AltGr on a European layout makes Windows send a Left Ctrl key message before the Right
+                   Alt one, with the same time; when the next message is that Right Alt, the Ctrl is dropped (GLFW's
+                   rule), so a program sees the Right Alt alone */
+                if ((wParam == VK_CONTROL) && !(HIWORD(lParam) & KF_EXTENDED)) {
+                    MSG next;
+                    const DWORD time = GetMessageTime();
+                    if (PeekMessageW(&next, NULL, 0, 0, PM_NOREMOVE) &&
+                        ((next.message == WM_KEYDOWN) || (next.message == WM_SYSKEYDOWN) ||
+                         (next.message == WM_KEYUP) || (next.message == WM_SYSKEYUP)) &&
+                        (next.wParam == VK_MENU) && (HIWORD(next.lParam) & KF_EXTENDED) && (next.time == time))
+                    {
+                        break;
+                    }
+                }
+                if ((uMsg == WM_KEYDOWN) || (uMsg == WM_SYSKEYDOWN)) {
+                    _sapp_win32_key_event(SAPP_EVENTTYPE_KEY_DOWN, (int)(HIWORD(lParam)&0x1FF), !!(lParam&0x40000000));
+                }
+                else {
+                    _sapp_win32_key_event(SAPP_EVENTTYPE_KEY_UP, (int)(HIWORD(lParam)&0x1FF), false);
+                }
                 break;
             case WM_ENTERSIZEMOVE:
                 SetTimer(_sapp.win32.hwnd, 1, USER_TIMER_MINIMUM, NULL);
